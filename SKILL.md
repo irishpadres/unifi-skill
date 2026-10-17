@@ -6,8 +6,8 @@ description: Monitor and configure UniFi network infrastructure. Auto-routes bet
 metadata:
   openclaw:
     requires:
-      env: ["UNIFI_API_KEY"]
-      optionalEnv: ["UNIFI_BASE_URL", "UNIFI_GATEWAY_IP", "UNIFI_LOCAL_API_KEY"]
+      env: []
+      optionalEnv: ["UNIFI_API_KEY", "UNIFI_BASE_URL", "UNIFI_GATEWAY_IP", "UNIFI_LOCAL_API_KEY"]
 ---
 
 # UniFi Network API
@@ -21,12 +21,19 @@ Monitor and configure UniFi network infrastructure.
 See [SETUP.md](SETUP.md) for prerequisites and setup instructions.
 
 Config (`config.json`):
-- `api_key` — UniFi Cloud API key (required)
-- `gateway_ip` — Local gateway IP (for faster local access)
+- `api_key` — UniFi Cloud API key (required for cloud commands; optional for local-only use)
+- `gateway_ip` — Local gateway IP (for local access)
 - `local_api_key` — Local gateway API key
+- `gateway_fingerprint` — TLS certificate SHA-256 fingerprint (required for local access)
 - `site_id` — Default site UUID (auto-detected if only one site)
 
 Routing is automatic: local gateway when reachable, cloud connector when remote. Use `--local` to force local-only.
+
+**Cloud-only commands** (need `api_key`; no `--local` flag): `list-hosts`, `list-sites`, `list-devices`, `list-aps`. `firmware-status` reads device firmware from the local/connector API (supports `--local`), but its "Cloud Key / Controller" section needs the cloud key and is skipped without it.
+
+**Local-capable commands** (support `--local`): everything else, e.g. `list-site-devices`, `list-clients`, `list-events`, `get-*`, `set-*`, `label-client`.
+
+**Least privilege:** API keys inherit the role of the UniFi user that creates them. Create keys as a *View Only* user so `set-*` and `label-client` commands fail. (Verified: such a key reports `site_role: "readonly"`, `is_super: false` via `GET /proxy/network/api/s/default/self`.)
 
 ## Commands
 
@@ -95,12 +102,14 @@ python3 {baseDir}/scripts/unifi.py set-radio --ap Living --band 5 \
 ```bash
 python3 {baseDir}/scripts/unifi.py list-events                # All site events
 python3 {baseDir}/scripts/unifi.py list-events --filter Roam   # Filter by event type
-python3 {baseDir}/scripts/unifi.py list-events --mac aa:bb:cc:dd:ee:ff  # Filter by MAC
+python3 {baseDir}/scripts/unifi.py list-events --mac aa:bb:cc:dd:ee:ff  # Filter by client/device MAC
+python3 {baseDir}/scripts/unifi.py list-events --days 1 --limit 20       # Last 24h, at most 20 events
 ```
 
 ## Notes
 
 - Site is auto-detected when only one exists; use `--site <siteId>` otherwise
 - `--local` forces local gateway access (errors if unreachable)
+- `list-events` uses the v2 `system-log/all` endpoint (a read-only POST query) on Network 10.x, and falls back to classic `stat/event` on older controllers (where `--days`/`--limit` are ignored)
 - Event buffer is limited (~3 weeks of history depending on volume)
 - Apple devices use randomized MACs; use `label-client` to track them by their per-network Wi-Fi Address

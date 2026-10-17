@@ -31,19 +31,29 @@ def _load_config() -> Dict[str, Any]:
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
 
+    # The cloud api_key is optional here: local-only setups don't need it.
+    # It is enforced lazily by _require_api_key() when a cloud call is made.
     api_key = os.environ.get("UNIFI_API_KEY") or cfg.get("api_key")
-    if not api_key:
-        raise SystemExit(
-            "Missing UniFi API key. Set UNIFI_API_KEY or create config.json (see config.json.example)."
-        )
-
-    cfg["api_key"] = api_key
+    if api_key:
+        cfg["api_key"] = api_key
     return cfg
 
 
 CONFIG = _load_config()
-API_KEY = CONFIG["api_key"]
 BASE_URL = "https://api.ui.com"
+
+
+def _require_api_key() -> str:
+    """Return the cloud (Site Manager) API key, or exit with a clear error if missing."""
+    api_key = os.environ.get("UNIFI_API_KEY") or CONFIG.get("api_key")
+    if not api_key:
+        print(
+            "Error: This command needs a UniFi cloud API key. "
+            "Set UNIFI_API_KEY or add api_key to config.json (see config.json.example).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return api_key
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +84,7 @@ def api_request(path: str) -> Dict[str, Any]:
     """Make an API request to the UniFi Site Manager (cloud)."""
     url = f"{BASE_URL}{path}"
     headers = {
-        "X-API-KEY": API_KEY,
+        "X-API-KEY": _require_api_key(),
         "Accept": "application/json",
     }
 
@@ -217,7 +227,7 @@ def _connector_request(path: str, console_id: str) -> Dict[str, Any]:
     """Make an integration API request via the cloud connector proxy."""
     url = f"{BASE_URL}/v1/connector/consoles/{console_id}/proxy/network/integration{path}"
     headers = {
-        "X-API-KEY": API_KEY,
+        "X-API-KEY": _require_api_key(),
         "Accept": "application/json",
     }
     try:
@@ -238,7 +248,7 @@ def _connector_classic_request(path: str, console_id: str, method: str = "GET",
     """Make a classic API request via the cloud connector proxy."""
     url = f"{BASE_URL}/v1/connector/consoles/{console_id}/proxy/network/api/s/default/{path}"
     headers = {
-        "X-API-KEY": API_KEY,
+        "X-API-KEY": _require_api_key(),
         "Accept": "application/json",
     }
     try:
@@ -303,6 +313,56 @@ def _classic_request(path: str, local: bool = False, method: str = "GET",
 
     print("Error: No local gateway or cloud connector available.", file=sys.stderr)
     sys.exit(1)
+
+
+class _V2NotFound(Exception):
+    """Raised when a v2 endpoint returns 404 (controller too old to have it)."""
+
+
+def _v2_request(path: str, payload: Dict[str, Any], local: bool = False) -> Dict[str, Any]:
+    """
+    Make a v2 API request (/v2/api/site/default/...) with a JSON body, choosing the
+    best transport (local gateway when reachable, cloud connector otherwise).
+
+    NOTE: This is an HTTP POST, but only for endpoints that take a query body
+    (e.g. system-log/all). Callers must only use it for read-only queries.
+    Raises _V2NotFound on HTTP 404 so callers can fall back to classic endpoints.
+    """
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if local or _is_local_reachable():
+        gateway_ip, local_api_key = _resolve_local_gateway()
+        if gateway_ip and local_api_key:
+            session, base = _get_local_session(gateway_ip)
+            url = f"{base}/proxy/network/v2/api/site/default/{path}"
+            headers["X-API-KEY"] = local_api_key
+            post = session.post
+            where = f"gateway at {gateway_ip}"
+        else:
+            print("Error: --local specified but gateway_ip/local_api_key not configured", file=sys.stderr)
+            sys.exit(1)
+    else:
+        console_id = _get_console_id()
+        if not console_id:
+            print("Error: No local gateway or cloud connector available.", file=sys.stderr)
+            sys.exit(1)
+        url = f"{BASE_URL}/v1/connector/consoles/{console_id}/proxy/network/v2/api/site/default/{path}"
+        headers["X-API-KEY"] = _require_api_key()
+        post = requests.post
+        where = "cloud connector"
+
+    try:
+        resp = post(url, headers=headers, json=payload, timeout=30)
+    except requests.ConnectionError:
+        print(f"Error: Could not connect via {where}", file=sys.stderr)
+        sys.exit(1)
+    except requests.Timeout:
+        print(f"Error: Request via {where} timed out", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code == 404:
+        raise _V2NotFound(url)
+    if not resp.ok:
+        _handle_api_error(resp, url)
+    return resp.json()
 
 
 def _integration_request(path: str, local: bool = False) -> Dict[str, Any]:
@@ -496,6 +556,21 @@ def cmd_list_devices(args):
             print()
 
 
+def _is_access_point(device: Dict[str, Any]) -> bool:
+    """Detect an access point by capability, falling back to model-name keywords."""
+    features = device.get("features")
+    if isinstance(features, dict):
+        features = list(features.keys())
+    if features:
+        return "accessPoint" in features
+    dev_type = device.get("type")
+    if dev_type:
+        return str(dev_type).lower() in ("uap", "accesspoint", "access_point")
+    # Fallback for payloads without capability info (e.g. cloud /v1/devices)
+    ap_keywords = ['AP', 'UAP', 'U6', 'U7', 'AC', 'IW', 'Mesh']
+    return any(keyword in device.get('model', '') for keyword in ap_keywords)
+
+
 def cmd_list_aps(args):
     """List access points only."""
     data = api_request("/v1/devices")
@@ -504,17 +579,13 @@ def cmd_list_aps(args):
         print("No devices found.")
         return
 
-    # Filter for access points (model contains AP-related keywords)
-    ap_keywords = ['AP', 'UAP', 'U6', 'AC', 'IW', 'Mesh']
     aps = []
 
     for host_data in data["data"]:
         devices = host_data.get("devices", [])
 
         for device in devices:
-            model = device.get('model', '')
-            # Check if this is an access point
-            if any(keyword in model for keyword in ap_keywords):
+            if _is_access_point(device):
                 aps.append(device)
 
     if args.json:
@@ -871,8 +942,103 @@ def cmd_list_known_clients(args):
         print()
 
 
+def _event_params(event: Dict[str, Any]) -> Dict[str, Any]:
+    params = event.get("parameters")
+    return params if isinstance(params, dict) else {}
+
+
+def _event_matches(event: Dict[str, Any], event_filter: Optional[str], mac_filter: Optional[str]) -> bool:
+    """Apply --filter (key/event/category) and --mac (parameters.*.id) to a v2 event."""
+    if event_filter:
+        needle = event_filter.lower()
+        if not any(needle in str(event.get(f) or "").lower() for f in ("key", "event", "category")):
+            return False
+    if mac_filter:
+        needle = mac_filter.lower()
+        if not any(isinstance(p, dict) and needle in str(p.get("id") or "").lower()
+                   for p in _event_params(event).values()):
+            return False
+    return True
+
+
+def _render_event_message(event: Dict[str, Any]) -> str:
+    """Fill {PLACEHOLDERS} in message_raw from parameters[X].name (fallback .id)."""
+    template = event.get("message_raw") or event.get("title_raw") or ""
+    params = _event_params(event)
+
+    def _sub(m):
+        p = params.get(m.group(1))
+        if isinstance(p, dict):
+            return str(p.get("name") or p.get("id") or m.group(0))
+        return m.group(0)
+
+    return re.sub(r"\{(\w+)\}", _sub, template)
+
+
 def cmd_list_events(args):
-    """List site events from classic API (roaming, AP events, etc.)."""
+    """List site events (roaming, AP events, etc.) via the v2 system-log API."""
+    from datetime import datetime, timezone, timedelta
+    import time
+
+    local = getattr(args, 'local', False)
+    days = getattr(args, 'days', 7)
+    limit = getattr(args, 'limit', 100)
+    event_filter = getattr(args, 'filter', None)
+    mac_filter = getattr(args, 'mac', None)
+
+    now_ms = int(time.time() * 1000)
+    page_size = max(1, min(limit, 50))
+    events: List[Dict[str, Any]] = []
+    page = 0
+    while len(events) < limit:
+        payload = {
+            "pageNumber": page,
+            "pageSize": page_size,
+            "timestampFrom": now_ms - int(days * 86400 * 1000),
+            "timestampTo": now_ms,
+        }
+        try:
+            # Read-only query despite being a POST (see _v2_request).
+            data = _v2_request("system-log/all", payload, local=local)
+        except _V2NotFound:
+            if page == 0:
+                _list_events_classic(args)
+                return
+            break
+        items = data.get("data", [])
+        events.extend(e for e in items if _event_matches(e, event_filter, mac_filter))
+        total_pages = data.get("total_page_count", 0)
+        if not items or page + 1 >= total_pages:
+            break
+        page += 1
+    events = events[:limit]
+
+    if not events:
+        print("No events found.")
+        return
+
+    if args.json:
+        print(json.dumps(events, indent=2))
+        return
+
+    tz_offset = timedelta(hours=1)  # CET
+
+    def _fmt(ts):
+        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) + tz_offset
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    print(f"\n=== Events ({len(events)}) ===\n")
+
+    for e in events:
+        key = e.get("key") or e.get("event") or "?"
+        print(f"{_fmt(e.get('timestamp', 0))}  {key}  {_render_event_message(e)}")
+
+    stamps = [e.get("timestamp", 0) for e in events]
+    print(f"\nTime range: {_fmt(min(stamps))[:10]} → {_fmt(max(stamps))[:10]}")
+
+
+def _list_events_classic(args):
+    """Fallback for older controllers: classic stat/event API (removed in Network 10.x)."""
     local = getattr(args, 'local', False)
     data = _classic_request("stat/event", local=local)
     events = data.get("data", [])
@@ -1691,9 +1857,13 @@ def main():
     parser_events = subparsers.add_parser("list-events",
                                            help="List site events (roaming, AP changes, etc.)")
     parser_events.add_argument("--filter", default=None,
-                                help="Filter by event key (e.g. Roam, AP, Channel)")
+                                help="Filter by event key/event/category (e.g. Roam, AP, Channel)")
     parser_events.add_argument("--mac", default=None,
-                                help="Filter by client or AP MAC address")
+                                help="Filter by client or device MAC address")
+    parser_events.add_argument("--days", type=float, default=7,
+                                help="How many days back to query (default: 7)")
+    parser_events.add_argument("--limit", type=int, default=100,
+                                help="Maximum number of events to return (default: 100)")
     parser_events.add_argument("--local", action="store_true",
                                 help="Force local gateway access")
     parser_events.set_defaults(func=cmd_list_events)

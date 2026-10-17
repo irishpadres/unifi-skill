@@ -7,7 +7,7 @@
 
 ## API Keys
 
-You need one or both API keys:
+You need one or both API keys (a local-only setup works without a cloud key):
 
 1. **Site Manager API key** — for cloud access (works remotely)
    - Go to [unifi.ui.com](https://unifi.ui.com) → Account → API Keys → Create
@@ -33,17 +33,17 @@ Create `config.json` next to SKILL.md (gitignored). Start from `config.json.exam
 
 | Field | Required | Description |
 |---|---|---|
-| `api_key` | Yes | Site Manager API key (cloud access) |
-| `gateway_ip` | No | Local gateway/console IP address |
-| `local_api_key` | No | Local gateway API key |
-| `gateway_fingerprint` | No | SHA-256 fingerprint of the gateway's TLS certificate |
+| `api_key` | For cloud commands | Site Manager API key (cloud access). Not needed for local-only use |
+| `gateway_ip` | For local access | Local gateway/console IP address |
+| `local_api_key` | For local access | Local gateway API key |
+| `gateway_fingerprint` | For local access | SHA-256 fingerprint of the gateway's TLS certificate (certificate pinning is mandatory) |
 | `site_id` | No | Default site UUID (auto-detected if only one site) |
 
 Alternatively, use environment variables: `UNIFI_API_KEY`, `UNIFI_GATEWAY_IP`, `UNIFI_LOCAL_API_KEY`.
 
 ## Local HTTPS & Certificate Pinning
 
-Local gateway requests always use HTTPS. When `gateway_fingerprint` is configured, the connection is pinned to that exact certificate — more secure than CA-based verification and works with self-signed certificates.
+Local gateway requests always use HTTPS and are pinned to that exact certificate — more secure than CA-based verification and works with self-signed certificates.
 
 **Get your gateway's certificate fingerprint:**
 
@@ -69,9 +69,13 @@ Copy the fingerprint (everything after `=`) into `config.json`:
 }
 ```
 
-Without a fingerprint, local requests still use HTTPS but without certificate verification.
+`gateway_fingerprint` is **required** for local access: without it the skill refuses to talk to the gateway ("No gateway_fingerprint configured. Local HTTPS requires certificate pinning.").
 
 > **Note:** If the gateway's certificate changes (e.g. after a firmware update or reset), update the fingerprint in `config.json`.
+
+## Least privilege
+
+API keys inherit the role of the UniFi user that creates them. To make a key read-only, create it while signed in as a **View Only** user: `set-*` and `label-client` commands will then fail. (A key from a View Only user reports `site_role: "readonly"` and `is_super: false` via `GET /proxy/network/api/s/default/self`.)
 
 ## Cloud Connector Requirements
 
