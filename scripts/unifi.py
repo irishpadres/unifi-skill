@@ -911,8 +911,7 @@ def cmd_list_known_clients(args):
 
     print(f"\n=== Known Clients ({len(all_clients)}) ===\n")
 
-    from datetime import datetime, timezone, timedelta
-    tz_offset = timedelta(hours=1)  # CET
+    from datetime import datetime
 
     for client in all_clients:
         name = client.get("name") or ""
@@ -925,7 +924,7 @@ def cmd_list_known_clients(args):
         last_seen = client.get("last_seen")
         last_seen_str = ""
         if last_seen:
-            dt = datetime.fromtimestamp(last_seen, tz=timezone.utc) + tz_offset
+            dt = datetime.fromtimestamp(last_seen)
             last_seen_str = dt.strftime("%Y-%m-%d %H:%M")
 
         display_name = name or hostname or "(unnamed)"
@@ -940,6 +939,9 @@ def cmd_list_known_clients(args):
         if last_seen_str:
             print(f"    Last seen: {last_seen_str}")
         print()
+
+
+_MAX_FILTERED_EVENT_PAGES = 20
 
 
 def _event_params(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -977,7 +979,7 @@ def _render_event_message(event: Dict[str, Any]) -> str:
 
 def cmd_list_events(args):
     """List site events (roaming, AP events, etc.) via the v2 system-log API."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime
     import time
 
     local = getattr(args, 'local', False)
@@ -990,7 +992,13 @@ def cmd_list_events(args):
     page_size = max(1, min(limit, 50))
     events: List[Dict[str, Any]] = []
     page = 0
+    # Filters are applied client-side, so a rare match would otherwise download every page.
+    max_pages = _MAX_FILTERED_EVENT_PAGES if (event_filter or mac_filter) else None
     while len(events) < limit:
+        if max_pages is not None and page >= max_pages:
+            print(f"Note: scanned {max_pages} pages ({max_pages * page_size} events); "
+                  "narrow the window with --days for older matches.", file=sys.stderr)
+            break
         payload = {
             "pageNumber": page,
             "pageSize": page_size,
@@ -1021,11 +1029,9 @@ def cmd_list_events(args):
         print(json.dumps(events, indent=2))
         return
 
-    tz_offset = timedelta(hours=1)  # CET
-
     def _fmt(ts):
-        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) + tz_offset
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        # Local time of the machine running the CLI
+        return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
     print(f"\n=== Events ({len(events)}) ===\n")
 
@@ -1082,14 +1088,13 @@ def _list_events_classic(args):
     except SystemExit:
         pass
 
-    from datetime import datetime, timezone, timedelta
-    tz_offset = timedelta(hours=1)  # CET
+    from datetime import datetime
 
     print(f"\n=== Events ({len(events)}) ===\n")
 
     for e in events:
         ts = e.get("time", 0)
-        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) + tz_offset
+        dt = datetime.fromtimestamp(ts / 1000)
         time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
 
         key = e.get("key", "?")
@@ -1126,8 +1131,8 @@ def _list_events_classic(args):
     if events:
         first_ts = events[-1].get("time", 0)
         last_ts = events[0].get("time", 0)
-        from_dt = datetime.fromtimestamp(first_ts / 1000, tz=timezone.utc) + tz_offset
-        to_dt = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc) + tz_offset
+        from_dt = datetime.fromtimestamp(first_ts / 1000)
+        to_dt = datetime.fromtimestamp(last_ts / 1000)
         print(f"\nTime range: {from_dt.strftime('%Y-%m-%d')} → {to_dt.strftime('%Y-%m-%d')}")
 
 

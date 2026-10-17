@@ -123,6 +123,25 @@ class ListEventsV2(LocalSession):
             _run(unifi.cmd_list_events, _args())
 
 
+class ListEventsLimits(LocalSession):
+    def test_filtered_scan_is_capped(self):
+        self.session.post.return_value = _resp(body={
+            "data": [_event()], "page_number": 0, "total_page_count": 500})
+        err = io.StringIO()
+        with redirect_stderr(err):
+            out = _run(unifi.cmd_list_events, _args(mac="ff:ff:ff:ff:ff:ff"))
+        self.assertEqual(self.session.post.call_count, unifi._MAX_FILTERED_EVENT_PAGES)
+        self.assertIn("No events found", out)
+        self.assertIn("scanned", err.getvalue())
+
+    def test_times_are_local(self):
+        from datetime import datetime
+        self.session.post.return_value = _resp(body={"data": [_event()], "total_page_count": 1})
+        out = _run(unifi.cmd_list_events, _args())
+        expected = datetime.fromtimestamp(1760000000).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertIn(expected, out)
+
+
 class ListAps(unittest.TestCase):
     def test_u7_pro_xg_detected_via_features(self):
         dev = {"name": "AP1", "model": "U7 Pro XG", "features": ["accessPoint"]}
